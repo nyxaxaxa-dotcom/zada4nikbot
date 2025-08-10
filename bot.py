@@ -1,5 +1,5 @@
 # bot.py
-# Требуется: python-telegram-bot >= 21  (pip install "python-telegram-bot>=21,<22")
+# Требуется: python-telegram-bot[webhooks] >= 21  (ставится из requirements.txt)
 
 import json
 import os
@@ -18,21 +18,30 @@ DATA_DIR.mkdir(exist_ok=True)
 
 TOKEN = os.getenv("TG_BOT_TOKEN")
 if not TOKEN:
-    raise RuntimeError("Не задан TG_BOT_TOKEN в окружении. Установи переменную и перезапусти.")
+    raise RuntimeError("Не задан TG_BOT_TOKEN в окружении.")
+
+REM_OPTIONS = {"1": 60 * 60, "3": 3 * 60 * 60, "6": 6 * 60 * 60}
 
 def _user_file(user_id: int) -> Path:
     return DATA_DIR / f"{user_id}.json"
+
+def _ensure_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
+    data.setdefault("seq", 0)
+    data.setdefault("tasks", {})
+    data.setdefault("stats", {"closed": 0})
+    return data
 
 def load_tasks(user_id: int) -> Dict[str, Any]:
     fp = _user_file(user_id)
     if fp.exists():
         try:
-            return json.loads(fp.read_text(encoding="utf-8"))
+            return _ensure_defaults(json.loads(fp.read_text(encoding="utf-8")))
         except Exception:
-            return {"seq": 0, "tasks": {}}
-    return {"seq": 0, "tasks": {}}
+            return {"seq": 0, "tasks": {}, "stats": {"closed": 0}}
+    return {"seq": 0, "tasks": {}, "stats": {"closed": 0}}
 
 def save_tasks(user_id: int, data: Dict[str, Any]) -> None:
+    data = _ensure_defaults(data)
     fp = _user_file(user_id)
     tmp = fp.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -46,12 +55,28 @@ def progress_bar(done: int, total: int, width: int = 10) -> str:
 
 def task_line(t: Dict[str, Any]) -> str:
     bar = progress_bar(t["done"], t["total"])
-    return f"{t['name']}  {bar}  {t['done']}/{t['total']}"
+    rem = ""
+    interval = t.get("reminder_interval")
+    if interval:
+        mp = {REM_OPTIONS["1"]: "1ч", REM_OPTIONS["3"]: "3ч", REM_OPTIONS["6"]: "6ч"}
+        rem = f" • напоминание: {mp.get(interval, str(interval)+'с')}"
+    return f"{t['name']}  {bar}  {t['done']}/{t['total']}{rem}"
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Задача", callback_data="ui:new")],
         [InlineKeyboardButton("📋 Мои задачи", callback_data="ui:list")]
+    ])
+
+def reminder_menu_kb(tid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔔 1 час", callback_data=f"t:rem1:{tid}"),
+            InlineKeyboardButton("🔔 3 часа", callback_data=f"t:rem3:{tid}"),
+            InlineKeyboardButton("🔔 6 часов", callback_data=f"t:rem6:{tid}"),
+        ],
+        [InlineKeyboardButton("🔕 Отключить", callback_data=f"t:remoff:{tid}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"t:open:{tid}")]
     ])
 
 def task_kb(task_id: int, t: Dict[str, Any]) -> InlineKeyboardMarkup:
@@ -67,6 +92,10 @@ def task_kb(task_id: int, t: Dict[str, Any]) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("♻️ Сброс", callback_data=f"t:rst:{task_id}"),
             InlineKeyboardButton("🗑 Удалить", callback_data=f"t:del:{task_id}")
+        ],
+        [
+            InlineKeyboardButton("🔔 Напоминание", callback_data=f"t:rem:{task_id}"),
+            InlineKeyboardButton("✅ Закрыть", callback_data=f"t:close:{task_id}")
         ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="ui:list")],
         [
@@ -101,15 +130,57 @@ async def safe_edit(query, text: str, reply_markup=None):
             return
         raise
 
+def _job_name(user_id: int, tid: int) -> str:
+    return f"rem:{user_id}:{tid}"
+
+def _cancel_reminder(app: Application, user_id: int, tid: int) -> None:
+    for job in app.job_queue.get_jobs_by_name(_job_name(user_id, tid)):
+        job.schedule_removal()
+
+def _schedule_reminder(app: Application, user_id: int, tid: int, interval: int) -> None:
+    _cancel_reminder(app, user_id, tid)
+    app.job_queue.run_repeating(
+        reminder_tick,
+        interval=interval,
+        first=interval,
+        name=_job_name(user_id, tid),
+        data={"user_id": user_id, "tid": tid},
+    )
+
+async def reminder_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = context.job.data["user_id"]
+    tid = context.job.data["tid"]
+    data = load_tasks(user_id)
+    t = data["tasks"].get(str(tid))
+    if not t:
+        _cancel_reminder(context.application, user_id, tid)
+        return
+    text = f"Напоминание по задаче: {t['name']}\nОткрыть, продлить или отключить?"
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔔 +1ч", callback_data=f"t:rem1:{tid}"),
+            InlineKeyboardButton("🔔 +3ч", callback_data=f"t:rem3:{tid}"),
+            InlineKeyboardButton("🔔 +6ч", callback_data=f"t:rem6:{tid}"),
+        ],
+        [
+            InlineKeyboardButton("Открыть карточку", callback_data=f"t:open:{tid}"),
+            InlineKeyboardButton("🔕 Выкл", callback_data=f"t:remoff:{tid}"),
+        ],
+    ])
+    try:
+        await context.bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
+    except Exception:
+        pass
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["awaiting"] = None
     text = (
         "Привет! Это минималистичный трекер задач для СДВГ в Telegram.\n"
-        "Создавай задачи с шагами, отмечай прогресс кнопками, смотри общий список.\n\n"
+        "Создавай задачи с шагами, отмечай прогресс кнопками, смотри список и статистику.\n\n"
         "Команды:\n"
-        "/new Название |5 — создать задачу с 5 шагами (по умолчанию 5)\n"
-        "/list — показать список задач\n\n"
-        "Или просто пользуйся кнопками ниже."
+        "/new Название |5 — создать задачу с 5 шагами\n"
+        "/list — показать список\n"
+        "/stats — показать статистику"
     )
     if update.message:
         await update.message.reply_text(text, reply_markup=main_menu_kb())
@@ -119,10 +190,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
 
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    data = load_tasks(user_id)
+    opened = len(data["tasks"])
+    closed = data["stats"]["closed"]
+    await update.message.reply_text(f"Статистика: открытых {opened}, закрытых {closed}", reply_markup=main_menu_kb())
+
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     data = load_tasks(user_id)
-
     raw = " ".join(context.args) if context.args else ""
     if not raw:
         context.user_data["awaiting"] = {"mode": "new"}
@@ -131,13 +208,11 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=main_menu_kb()
         )
         return
-
     name, total = parse_new_payload(raw)
     data["seq"] += 1
     tid = data["seq"]
-    data["tasks"][str(tid)] = {"id": tid, "name": name, "done": 0, "total": total}
+    data["tasks"][str(tid)] = {"id": tid, "name": name, "done": 0, "total": total, "reminder_interval": None}
     save_tasks(user_id, data)
-
     await update.message.reply_text(
         f"Создано: {task_line(data['tasks'][str(tid)])}",
         reply_markup=task_kb(tid, data["tasks"][str(tid)])
@@ -146,22 +221,22 @@ async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     data = load_tasks(user_id)
+    opened = len(data["tasks"])
+    closed = data["stats"]["closed"]
     if not data["tasks"]:
-        txt = "Пока нет задач. Нажми «➕ Задача» или команда /new Название |5"
+        txt = f"Пока нет задач. Открытых {opened}, закрытых {closed}.\nНажми «➕ Задача» или команда /new Название |5"
         if update.message:
             await update.message.reply_text(txt, reply_markup=main_menu_kb())
         else:
             await safe_edit(update.callback_query, txt, reply_markup=main_menu_kb())
         return
-
-    lines = []
+    lines = [f"Открытых: {opened} | Закрытых: {closed}", ""]
     keyboard = []
     for sid, t in sorted(data["tasks"].items(), key=lambda x: int(x[0])):
         tid = int(sid)
         lines.append(f"{tid}. {task_line(t)}")
         keyboard.append([InlineKeyboardButton(f"Открыть: {t['name']}", callback_data=f"t:open:{tid}")])
-
-    text = "Мои задачи:\n" + "\n".join(lines)
+    text = "\n".join(lines)
     kb = InlineKeyboardMarkup(keyboard + [[InlineKeyboardButton("⬅️ Меню", callback_data="ui:menu")]])
     if update.message:
         await update.message.reply_text(text, reply_markup=kb)
@@ -173,15 +248,12 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await q.answer()
     user_id = update.effective_user.id
     data = load_tasks(user_id)
-
     if not q.data:
         return
-
     if q.data == "ui:menu":
         context.user_data["awaiting"] = None
         await safe_edit(q, "Главное меню", reply_markup=main_menu_kb())
         return
-
     if q.data == "ui:new":
         context.user_data["awaiting"] = {"mode": "new"}
         await safe_edit(
@@ -190,23 +262,63 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="ui:menu")]])
         )
         return
-
     if q.data == "ui:list":
         await list_cmd(update, context)
         return
-
     if q.data == "noop":
         return
 
+    if q.data.startswith("t:rem:"):
+        try:
+            _, _, sid = q.data.split(":")
+            tid = int(sid)
+        except Exception:
+            return
+        t = data["tasks"].get(str(tid))
+        if not t:
+            await safe_edit(q, "Эта задача уже отсутствует.", reply_markup=main_menu_kb())
+            return
+        await safe_edit(q, f"Напоминания для: {t['name']}\nВыбери интервал или отключи.", reply_markup=reminder_menu_kb(tid))
+        return
+
+    parts = q.data.split(":")
     try:
-        _, action, sid = q.data.split(":")
-        tid = int(sid)
+        if len(parts) == 3:
+            _, action, sid = parts
+            tid = int(sid)
+        elif len(parts) == 4:
+            _, action, _, sid = parts
+            tid = int(sid)
+        else:
+            return
     except Exception:
         return
 
     t = data["tasks"].get(str(tid))
-    if not t:
+    if action not in {"rem1", "rem3", "rem6", "remoff"} and not t and action not in {"close"}:
         await safe_edit(q, "Эта задача уже отсутствует.", reply_markup=main_menu_kb())
+        return
+
+    if action in {"rem1", "rem3", "rem6"}:
+        interval = REM_OPTIONS[action[-1]]
+        if t:
+            t["reminder_interval"] = interval
+            save_tasks(user_id, data)
+        _schedule_reminder(context.application, user_id, tid, interval)
+        await safe_edit(q, f"Напоминание установлено: каждые {action[-1]}ч.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад к задаче", callback_data=f"t:open:{tid}")],
+            [InlineKeyboardButton("🔕 Отключить", callback_data=f"t:remoff:{tid}")]
+        ]))
+        return
+
+    if action == "remoff":
+        if t:
+            t["reminder_interval"] = None
+            save_tasks(user_id, data)
+        _cancel_reminder(context.application, user_id, tid)
+        await safe_edit(q, "Напоминания отключены.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад к задаче", callback_data=f"t:open:{tid}")],
+        ]))
         return
 
     if action == "open":
@@ -232,7 +344,15 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     elif action == "rst":
         t["done"] = 0
     elif action == "del":
+        _cancel_reminder(context.application, user_id, tid)
         del data["tasks"][str(tid)]
+        save_tasks(user_id, data)
+        await list_cmd(update, context)
+        return
+    elif action == "close":
+        _cancel_reminder(context.application, user_id, tid)
+        del data["tasks"][str(tid)]
+        data["stats"]["closed"] = int(data["stats"].get("closed", 0)) + 1
         save_tasks(user_id, data)
         await list_cmd(update, context)
         return
@@ -243,16 +363,14 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     awaiting = context.user_data.get("awaiting")
-
     if awaiting:
         mode = awaiting.get("mode")
         data = load_tasks(user_id)
-
         if mode == "new":
             name, total = parse_new_payload(update.message.text)
             data["seq"] += 1
             tid = data["seq"]
-            data["tasks"][str(tid)] = {"id": tid, "name": name, "done": 0, "total": total}
+            data["tasks"][str(tid)] = {"id": tid, "name": name, "done": 0, "total": total, "reminder_interval": None}
             save_tasks(user_id, data)
             context.user_data["awaiting"] = None
             await update.message.reply_text(
@@ -260,7 +378,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=task_kb(tid, data["tasks"][str(tid)])
             )
             return
-
         if mode == "rename":
             tid = int(awaiting["id"])
             t = data["tasks"].get(str(tid))
@@ -270,7 +387,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text(task_line(t), reply_markup=task_kb(tid, t))
             context.user_data["awaiting"] = None
             return
-
         if mode == "settotal":
             tid = int(awaiting["id"])
             t = data["tasks"].get(str(tid))
@@ -287,7 +403,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     return
             context.user_data["awaiting"] = None
             return
-
     await update.message.reply_text("Выбери действие:", reply_markup=main_menu_kb())
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -295,6 +410,18 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(err, BadRequest) and "Message is not modified" in str(err):
         return
     print("ERROR:", err)
+
+def _restore_reminders(app: Application) -> None:
+    for fp in DATA_DIR.glob("*.json"):
+        try:
+            user_id = int(fp.stem)
+        except ValueError:
+            continue
+        data = load_tasks(user_id)
+        for sid, t in data["tasks"].items():
+            interval = t.get("reminder_interval")
+            if interval:
+                _schedule_reminder(app, user_id, int(sid), int(interval))
 
 def make_app() -> Application:
     return Application.builder().token(TOKEN).build()
@@ -305,9 +432,12 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CallbackQueryHandler(on_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
+
+    _restore_reminders(app)
 
     public_url = os.getenv("PUBLIC_URL")
     if public_url:
