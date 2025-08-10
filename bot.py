@@ -3,13 +3,12 @@
 
 import json
 import os
-import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -17,10 +16,11 @@ from telegram.ext import (
 )
 
 # ---------- ХРАНИЛИЩЕ ДАННЫХ ----------
+# Если DATA_DIR не задан, пишем локально в ./data (на Render без диска данные сотрутся при новом деплое)
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Логи кладём внутрь DATA_DIR, чтобы тоже сохранялись на диске
+# Логи кладём рядом, чтобы видеть действия
 LOGS_DIR = DATA_DIR / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -33,6 +33,7 @@ ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(ch)
 
+# Токен берём из окружения
 TOKEN = os.getenv("TG_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Не задан TG_BOT_TOKEN в окружении.")
@@ -46,6 +47,7 @@ REM_OPTIONS = {
     "6h": 6 * 60 * 60,
 }
 
+# ---------- УТИЛЫ ХРАНИЛИЩА ----------
 def _user_file(user_id: int) -> Path:
     return DATA_DIR / f"{user_id}.json"
 
@@ -467,11 +469,6 @@ def make_app() -> Application:
     return Application.builder().token(TOKEN).build()
 
 def main() -> None:
-    public_url = os.getenv("PUBLIC_URL")
-    if public_url:
-        # перед запуском вебхука удаляем старый, чтобы не было Conflict
-        asyncio.run(Bot(TOKEN).delete_webhook(drop_pending_updates=True))
-
     app = make_app()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -486,7 +483,9 @@ def main() -> None:
     _restore_reminders(app)
     logger.info("BOOT: app started, reminders restored")
 
+    public_url = os.getenv("PUBLIC_URL")
     if public_url:
+        # РЕЖИМ ВЕБХУКОВ. НИКАКОГО POLLING при наличии PUBLIC_URL.
         port = int(os.getenv("PORT", "10000"))
         path = os.getenv("WEBHOOK_PATH", "/hook")
         app.run_webhook(
@@ -498,6 +497,7 @@ def main() -> None:
             allowed_updates=Update.ALL_TYPES,
         )
     else:
+        # Локальный режим (например, на твоём ПК)
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
