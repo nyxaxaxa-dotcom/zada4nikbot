@@ -1,4 +1,3 @@
-git --version
 # bot.py
 # Требуется: python-telegram-bot >= 21  (pip install "python-telegram-bot>=21,<22")
 
@@ -14,11 +13,12 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-DATA_DIR = Path(".venv/data")
+DATA_DIR = Path("./data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# Твой токен (после теста лучше /revoke и заменить)
-TOKEN = "8294959063:AAFEriM_sicn3-GNGXaR2WmRdp8M6bSaN_M"
+TOKEN = os.getenv("TG_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("Не задан TG_BOT_TOKEN в окружении. Установи переменную и перезапусти.")
 
 def _user_file(user_id: int) -> Path:
     return DATA_DIR / f"{user_id}.json"
@@ -69,7 +69,6 @@ def task_kb(task_id: int, t: Dict[str, Any]) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗑 Удалить", callback_data=f"t:del:{task_id}")
         ],
         [InlineKeyboardButton("⬅️ Назад", callback_data="ui:list")],
-        # Новый ряд для быстрого добавления следующей задачи
         [
             InlineKeyboardButton("➕ Новая", callback_data="ui:new"),
             InlineKeyboardButton("📋 Список", callback_data="ui:list")
@@ -313,7 +312,7 @@ def main() -> None:
     public_url = os.getenv("PUBLIC_URL")
     if public_url:
         port = int(os.getenv("PORT", "8080"))
-        path = os.getenv("WEBHOOK_PATH", f"/{TOKEN}")
+        path = os.getenv("WEBHOOK_PATH", "/hook")
         app.run_webhook(
             listen="0.0.0.0",
             port=port,
