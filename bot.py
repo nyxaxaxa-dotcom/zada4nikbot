@@ -1,23 +1,29 @@
 # bot.py
-# Требуется: python-telegram-bot[webhooks] >= 21  (см. requirements.txt)
+# Требуется: python-telegram-bot[webhooks,job-queue] >= 21  (см. requirements.txt)
 
 import json
 import os
+import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 
-# ---------- ЛОГИ ----------
-LOGS_DIR = Path("./logs")
-LOGS_DIR.mkdir(exist_ok=True)
+# ---------- ХРАНИЛИЩЕ ДАННЫХ ----------
+DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Логи кладём внутрь DATA_DIR, чтобы тоже сохранялись на диске
+LOGS_DIR = DATA_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
 logger = logging.getLogger("taskbot")
 logger.setLevel(logging.INFO)
 fh = RotatingFileHandler(LOGS_DIR / "bot.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
@@ -27,14 +33,11 @@ ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(ch)
 
-# ---------- ДАННЫЕ ----------
-DATA_DIR = Path("./data")
-DATA_DIR.mkdir(exist_ok=True)
-
 TOKEN = os.getenv("TG_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Не задан TG_BOT_TOKEN в окружении.")
 
+# интервалы напоминаний
 REM_OPTIONS = {
     "5m": 5 * 60,
     "30m": 30 * 60,
@@ -48,7 +51,7 @@ def _user_file(user_id: int) -> Path:
 
 def _ensure_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
     data.setdefault("seq", 0)
-    data.setdefault("tasks", {})  # id -> {id, name, progress(0..100), reminder_interval}
+    data.setdefault("tasks", {})           # id -> {id, name, progress(0..100), reminder_interval}
     data.setdefault("stats", {"closed": 0})
     return data
 
@@ -68,12 +71,12 @@ def save_tasks(user_id: int, data: Dict[str, Any]) -> None:
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(fp)
 
-# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
-PALETTE = ["🟥","🟥","🟧","🟧","🟨","🟨","🟩","🟩","🟩","🟩"]  # слева красный -> справа зелёный
+# ---------- ВИЗУАЛ ПРОГРЕССА ----------
+PALETTE = ["🟥","🟥","🟧","🟧","🟨","🟨","🟩","🟩","🟩","🟩"]
 EMPTY = "◻️"
 
 def progress_bar(percent: int) -> str:
-    pct = max(0, min(100, percent))
+    pct = max(0, min(100, int(percent)))
     filled = round(pct / 10)  # 0..10 сегментов
     bar = "".join(PALETTE[i] for i in range(filled)) + (EMPTY * (10 - filled))
     return f"{bar} {pct}%"
@@ -90,7 +93,7 @@ def task_line(t: Dict[str, Any]) -> str:
     }
     if interval:
         rem = f" • напоминание: {labels.get(int(interval), str(interval)+'с')}"
-    return f"{t['name']}\n{progress_bar(int(t.get('progress', 0)))}{rem}"
+    return f"{t['name']}\n{progress_bar(t.get('progress', 0))}{rem}"
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -137,7 +140,6 @@ def task_kb(task_id: int, t: Dict[str, Any]) -> InlineKeyboardMarkup:
     ])
 
 def parse_new_payload(text: str) -> Tuple[str, int]:
-    # только название, без шагов
     return text.strip(), 0
 
 async def safe_edit(query, text: str, reply_markup=None):
@@ -221,8 +223,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["awaiting"] = None
     text = (
         "Привет! Это минималистичный трекер-напоминалка.\n"
-        "Команды:\n"
-        "/new Название — создать задачу\n"
+        "/new Название — создать\n"
         "/list — список\n"
         "/stats — статистика\n"
         "/debugrem — активные напоминания"
@@ -314,7 +315,6 @@ async def on_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if q.data == "noop":
         return
-
     if q.data.startswith("t:rem:"):
         try:
             _, _, sid = q.data.split(":")
@@ -467,6 +467,11 @@ def make_app() -> Application:
     return Application.builder().token(TOKEN).build()
 
 def main() -> None:
+    public_url = os.getenv("PUBLIC_URL")
+    if public_url:
+        # перед запуском вебхука удаляем старый, чтобы не было Conflict
+        asyncio.run(Bot(TOKEN).delete_webhook(drop_pending_updates=True))
+
     app = make_app()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -481,9 +486,8 @@ def main() -> None:
     _restore_reminders(app)
     logger.info("BOOT: app started, reminders restored")
 
-    public_url = os.getenv("PUBLIC_URL")
     if public_url:
-        port = int(os.getenv("PORT", "8080"))
+        port = int(os.getenv("PORT", "10000"))
         path = os.getenv("WEBHOOK_PATH", "/hook")
         app.run_webhook(
             listen="0.0.0.0",
